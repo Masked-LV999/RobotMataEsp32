@@ -26,6 +26,9 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
@@ -46,6 +49,9 @@ class MainActivity : AppCompatActivity() {
     private val broadcastIp = "255.255.255.255"
     private val esp32Port = 4210
 
+    // Batas rasio tinggi kotak deteksi (0.0 - 1.0): makin besar angkanya, makin dekat baru berhenti
+    private val stopDistanceRatio = 0.55f
+
     private var isEyeFullscreen = false
     private var currentMode = "BROADCAST"
     private var manualIp = "192.168.4.1"
@@ -56,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var eyeVideoView: VideoView
     private lateinit var statusText: TextView
     private lateinit var targetInfoText: TextView
+    private lateinit var distanceInfoText: TextView
     private lateinit var videoInfoText: TextView
     private lateinit var modeGroup: RadioGroup
     private lateinit var rbBroadcast: RadioButton
@@ -125,7 +132,13 @@ class MainActivity : AppCompatActivity() {
         targetInfoText = TextView(this).apply {
             text = "Target: ${activeTargetIp()}:$esp32Port ($currentMode)"
             textSize = 14f
-            setPadding(0, 6, 0, 14)
+            setPadding(0, 6, 0, 4)
+        }
+
+        distanceInfoText = TextView(this).apply {
+            text = "Tinggi objek: - | Batas stop: ${(stopDistanceRatio * 100).toInt()}%"
+            textSize = 13f
+            setPadding(0, 0, 0, 14)
         }
 
         modeGroup = RadioGroup(this).apply {
@@ -199,6 +212,7 @@ class MainActivity : AppCompatActivity() {
 
         controlLayout.addView(statusText)
         controlLayout.addView(targetInfoText)
+        controlLayout.addView(distanceInfoText)
         controlLayout.addView(modeGroup)
         controlLayout.addView(etManualIp)
         controlLayout.addView(btnSaveIp)
@@ -278,11 +292,23 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    private fun setStatusBarHidden(hidden: Boolean) {
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (hidden) {
+            controller.hide(WindowInsetsCompat.Type.statusBars())
+        } else {
+            controller.show(WindowInsetsCompat.Type.statusBars())
+        }
+    }
+
     private fun enterEyeFullscreen() {
         isEyeFullscreen = true
         controlLayout.visibility = View.GONE
         eyeFullscreenContainer.visibility = View.VISIBLE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setStatusBarHidden(true)
 
         val path = customVideoPath
         val videoUri = if (!path.isNullOrBlank() && File(path).exists()) {
@@ -301,6 +327,7 @@ class MainActivity : AppCompatActivity() {
         eyeFullscreenContainer.visibility = View.GONE
         controlLayout.visibility = View.VISIBLE
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setStatusBarHidden(false)
     }
 
     private fun activeTargetIp(): String {
@@ -363,6 +390,9 @@ class MainActivity : AppCompatActivity() {
                 }
             }?.boundingBox()
 
+            val height = rotated.height.toFloat()
+            val boxHeightRatio = personBox?.let { it.height() / height } ?: 0f
+
             val command = if (personBox == null) {
                 "DIAM"
             } else {
@@ -371,6 +401,7 @@ class MainActivity : AppCompatActivity() {
                 when {
                     centerX < width * 0.35f -> "KIRI"
                     centerX > width * 0.65f -> "KANAN"
+                    boxHeightRatio >= stopDistanceRatio -> "DIAM"
                     else -> "MAJU"
                 }
             }
@@ -379,9 +410,15 @@ class MainActivity : AppCompatActivity() {
             val useBroadcast = currentMode == "BROADCAST"
             sendUdp(command, targetIp, useBroadcast)
 
+            val ratioPercent = (boxHeightRatio * 100).toInt()
             runOnUiThread {
                 statusText.text = "Perintah: $command"
                 targetInfoText.text = "Target: $targetIp:$esp32Port ($currentMode)"
+                distanceInfoText.text = if (personBox != null) {
+                    "Tinggi objek: $ratioPercent% | Batas stop: ${(stopDistanceRatio * 100).toInt()}%"
+                } else {
+                    "Tinggi objek: - | Batas stop: ${(stopDistanceRatio * 100).toInt()}%"
+                }
             }
         } catch (e: Exception) {
             runOnUiThread {
