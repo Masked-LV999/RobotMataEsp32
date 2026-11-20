@@ -7,6 +7,7 @@ import android.graphics.Matrix
 import android.net.Uri
 import android.os.Bundle
 import android.util.Size
+import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
@@ -29,6 +30,8 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
+import java.io.File
+import java.io.FileOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -39,23 +42,27 @@ class MainActivity : AppCompatActivity() {
     private val prefsName = "robot_mata_prefs"
     private val keyMode = "ip_mode" // "BROADCAST" atau "MANUAL"
     private val keyManualIp = "manual_ip"
+    private val keyCustomVideoPath = "custom_video_path"
     private val broadcastIp = "255.255.255.255"
     private val esp32Port = 4210
 
     private var isEyeFullscreen = false
     private var currentMode = "BROADCAST"
     private var manualIp = "192.168.4.1"
+    private var customVideoPath: String? = null
 
     private lateinit var controlLayout: LinearLayout
     private lateinit var eyeFullscreenContainer: FrameLayout
     private lateinit var eyeVideoView: VideoView
     private lateinit var statusText: TextView
     private lateinit var targetInfoText: TextView
+    private lateinit var videoInfoText: TextView
     private lateinit var modeGroup: RadioGroup
     private lateinit var rbBroadcast: RadioButton
     private lateinit var rbManual: RadioButton
     private lateinit var etManualIp: EditText
     private lateinit var btnSaveIp: Button
+    private lateinit var btnPickVideo: Button
     private lateinit var btnOpenEye: Button
 
     private var objectDetector: ObjectDetector? = null
@@ -73,12 +80,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    private val pickVideoLauncher =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            if (uri != null) {
+                importCustomVideo(uri)
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val prefs = getSharedPreferences(prefsName, MODE_PRIVATE)
         currentMode = prefs.getString(keyMode, "BROADCAST") ?: "BROADCAST"
         manualIp = prefs.getString(keyManualIp, "192.168.4.1") ?: "192.168.4.1"
+        customVideoPath = prefs.getString(keyCustomVideoPath, null)
 
         buildUi()
         setupBackBehavior()
@@ -110,7 +125,7 @@ class MainActivity : AppCompatActivity() {
         targetInfoText = TextView(this).apply {
             text = "Target: ${activeTargetIp()}:$esp32Port ($currentMode)"
             textSize = 14f
-            setPadding(0, 8, 0, 20)
+            setPadding(0, 6, 0, 14)
         }
 
         modeGroup = RadioGroup(this).apply {
@@ -162,6 +177,19 @@ class MainActivity : AppCompatActivity() {
             targetInfoText.text = "Target: ${activeTargetIp()}:$esp32Port ($currentMode)"
         }
 
+        videoInfoText = TextView(this).apply {
+            text = getVideoLabel()
+            textSize = 13f
+            setPadding(0, 14, 0, 6)
+        }
+
+        btnPickVideo = Button(this).apply {
+            text = "Pilih / Ganti Video Mata"
+            setOnClickListener {
+                pickVideoLauncher.launch("video/*")
+            }
+        }
+
         btnOpenEye = Button(this).apply {
             text = "Tampilkan Mata Fullscreen"
             setOnClickListener {
@@ -174,13 +202,18 @@ class MainActivity : AppCompatActivity() {
         controlLayout.addView(modeGroup)
         controlLayout.addView(etManualIp)
         controlLayout.addView(btnSaveIp)
+        controlLayout.addView(videoInfoText)
+        controlLayout.addView(btnPickVideo)
         controlLayout.addView(btnOpenEye)
 
-        // 2. Layar Video Mata Fullscreen (keluar hanya lewat tombol Back)
+        // 2. Layar Video Mata Fullscreen (di tengah layar, keluar hanya lewat tombol Back)
         eyeFullscreenContainer = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
             visibility = View.GONE
             setBackgroundColor(0xFF000000.toInt())
-            // Menyerap sentuhan agar tidak sengaja menutup mode mata saat disentuh
             isClickable = true
             setOnClickListener { /* Sengaja diabaikan, keluar hanya via Back */ }
         }
@@ -188,7 +221,8 @@ class MainActivity : AppCompatActivity() {
         eyeVideoView = VideoView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER
             )
             setOnPreparedListener { mp ->
                 mp.isLooping = true
@@ -202,6 +236,33 @@ class MainActivity : AppCompatActivity() {
         root.addView(controlLayout)
         root.addView(eyeFullscreenContainer)
         setContentView(root)
+    }
+
+    private fun getVideoLabel(): String {
+        val path = customVideoPath
+        return if (!path.isNullOrBlank() && File(path).exists()) {
+            "Video aktif: Video kustom dari HP (loop)"
+        } else {
+            "Video aktif: Bawaan aplikasi (loop)"
+        }
+    }
+
+    private fun importCustomVideo(sourceUri: Uri) {
+        try {
+            val destFile = File(filesDir, "custom_eye_video.mp4")
+            contentResolver.openInputStream(sourceUri)?.use { input ->
+                FileOutputStream(destFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            customVideoPath = destFile.absolutePath
+            getSharedPreferences(prefsName, MODE_PRIVATE).edit()
+                .putString(keyCustomVideoPath, customVideoPath)
+                .apply()
+            videoInfoText.text = getVideoLabel()
+        } catch (e: Exception) {
+            videoInfoText.text = "Gagal memuat video: ${e.message}"
+        }
     }
 
     private fun setupBackBehavior() {
@@ -223,7 +284,13 @@ class MainActivity : AppCompatActivity() {
         eyeFullscreenContainer.visibility = View.VISIBLE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        val videoUri = Uri.parse("android.resource://$packageName/${R.raw.mata}")
+        val path = customVideoPath
+        val videoUri = if (!path.isNullOrBlank() && File(path).exists()) {
+            Uri.fromFile(File(path))
+        } else {
+            Uri.parse("android.resource://$packageName/${R.raw.mata}")
+        }
+
         eyeVideoView.setVideoURI(videoUri)
         eyeVideoView.start()
     }
