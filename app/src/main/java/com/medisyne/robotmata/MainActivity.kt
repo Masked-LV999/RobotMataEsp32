@@ -16,6 +16,8 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
+import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.VideoView
 import androidx.activity.OnBackPressedCallback
@@ -46,23 +48,25 @@ class MainActivity : AppCompatActivity() {
     private val keyMode = "ip_mode" // "BROADCAST" atau "MANUAL"
     private val keyManualIp = "manual_ip"
     private val keyCustomVideoPath = "custom_video_path"
+    private val keyStopPercent = "stop_distance_percent"
     private val broadcastIp = "255.255.255.255"
     private val esp32Port = 4210
 
-    // Batas rasio tinggi kotak deteksi (0.0 - 1.0): makin besar angkanya, makin dekat baru berhenti
-    private val stopDistanceRatio = 0.55f
-
+    // Default 80%: robot tetap MAJU sampai orang cukup dekat (tinggi objek >= 80% layar)
+    private var stopDistancePercent = 80
     private var isEyeFullscreen = false
     private var currentMode = "BROADCAST"
     private var manualIp = "192.168.4.1"
     private var customVideoPath: String? = null
 
+    private lateinit var controlScrollView: ScrollView
     private lateinit var controlLayout: LinearLayout
     private lateinit var eyeFullscreenContainer: FrameLayout
     private lateinit var eyeVideoView: VideoView
     private lateinit var statusText: TextView
     private lateinit var targetInfoText: TextView
     private lateinit var distanceInfoText: TextView
+    private lateinit var seekStopDistance: SeekBar
     private lateinit var videoInfoText: TextView
     private lateinit var modeGroup: RadioGroup
     private lateinit var rbBroadcast: RadioButton
@@ -101,6 +105,7 @@ class MainActivity : AppCompatActivity() {
         currentMode = prefs.getString(keyMode, "BROADCAST") ?: "BROADCAST"
         manualIp = prefs.getString(keyManualIp, "192.168.4.1") ?: "192.168.4.1"
         customVideoPath = prefs.getString(keyCustomVideoPath, null)
+        stopDistancePercent = prefs.getInt(keyStopPercent, 80).coerceIn(20, 95)
 
         buildUi()
         setupBackBehavior()
@@ -118,27 +123,57 @@ class MainActivity : AppCompatActivity() {
     private fun buildUi() {
         val root = FrameLayout(this)
 
-        // 1. Layar Kontrol & Pengaturan
+        // 1. Layar Kontrol dibungkus ScrollView agar tidak pernah terpotong di layar kecil/lanskap
+        controlScrollView = ScrollView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            isFillViewport = true
+        }
+
         controlLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(36, 36, 36, 36)
+            setPadding(32, 24, 32, 32)
         }
 
         statusText = TextView(this).apply {
             text = "Perintah: DIAM"
-            textSize = 22f
+            textSize = 20f
         }
 
         targetInfoText = TextView(this).apply {
             text = "Target: ${activeTargetIp()}:$esp32Port ($currentMode)"
-            textSize = 14f
-            setPadding(0, 6, 0, 4)
+            textSize = 13f
+            setPadding(0, 4, 0, 10)
         }
 
+        // Kontrol batas jarak berhenti (slider 20% - 95%)
         distanceInfoText = TextView(this).apply {
-            text = "Tinggi objek: - | Batas stop: ${(stopDistanceRatio * 100).toInt()}%"
+            text = "Tinggi objek: - | Batas stop: $stopDistancePercent% (geser kanan = bisa lebih dekat)"
             textSize = 13f
-            setPadding(0, 0, 0, 14)
+            setPadding(0, 4, 0, 4)
+        }
+
+        seekStopDistance = SeekBar(this).apply {
+            max = 75 // rentang 20..95 -> progress 0..75
+            progress = stopDistancePercent - 20
+            setPadding(0, 4, 0, 12)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    stopDistancePercent = progress + 20
+                    distanceInfoText.text =
+                        "Tinggi objek: - | Batas stop: $stopDistancePercent% (geser kanan = bisa lebih dekat)"
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    getSharedPreferences(prefsName, MODE_PRIVATE).edit()
+                        .putInt(keyStopPercent, stopDistancePercent)
+                        .apply()
+                }
+            })
         }
 
         modeGroup = RadioGroup(this).apply {
@@ -193,7 +228,7 @@ class MainActivity : AppCompatActivity() {
         videoInfoText = TextView(this).apply {
             text = getVideoLabel()
             textSize = 13f
-            setPadding(0, 14, 0, 6)
+            setPadding(0, 10, 0, 4)
         }
 
         btnPickVideo = Button(this).apply {
@@ -213,12 +248,15 @@ class MainActivity : AppCompatActivity() {
         controlLayout.addView(statusText)
         controlLayout.addView(targetInfoText)
         controlLayout.addView(distanceInfoText)
+        controlLayout.addView(seekStopDistance)
         controlLayout.addView(modeGroup)
         controlLayout.addView(etManualIp)
         controlLayout.addView(btnSaveIp)
         controlLayout.addView(videoInfoText)
         controlLayout.addView(btnPickVideo)
         controlLayout.addView(btnOpenEye)
+
+        controlScrollView.addView(controlLayout)
 
         // 2. Layar Video Mata Fullscreen (di tengah layar, keluar hanya lewat tombol Back)
         eyeFullscreenContainer = FrameLayout(this).apply {
@@ -247,7 +285,7 @@ class MainActivity : AppCompatActivity() {
 
         eyeFullscreenContainer.addView(eyeVideoView)
 
-        root.addView(controlLayout)
+        root.addView(controlScrollView)
         root.addView(eyeFullscreenContainer)
         setContentView(root)
     }
@@ -305,7 +343,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun enterEyeFullscreen() {
         isEyeFullscreen = true
-        controlLayout.visibility = View.GONE
+        controlScrollView.visibility = View.GONE
         eyeFullscreenContainer.visibility = View.VISIBLE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setStatusBarHidden(true)
@@ -325,7 +363,7 @@ class MainActivity : AppCompatActivity() {
         isEyeFullscreen = false
         eyeVideoView.stopPlayback()
         eyeFullscreenContainer.visibility = View.GONE
-        controlLayout.visibility = View.VISIBLE
+        controlScrollView.visibility = View.VISIBLE
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setStatusBarHidden(false)
     }
@@ -342,7 +380,7 @@ class MainActivity : AppCompatActivity() {
                     .build()
             )
             .setRunningMode(RunningMode.IMAGE)
-            .setScoreThreshold(0.5f)
+            .setScoreThreshold(0.35f)
             .setMaxResults(5)
             .build()
 
@@ -380,8 +418,11 @@ class MainActivity : AppCompatActivity() {
     private fun processFrame(imageProxy: ImageProxy) {
         try {
             val bitmap = imageProxy.toBitmap()
-            val rotated = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees.toFloat())
-            val mpImage = BitmapImageBuilder(rotated).build()
+            val prepared = rotateAndMirrorFrontCamera(
+                bitmap,
+                imageProxy.imageInfo.rotationDegrees.toFloat()
+            )
+            val mpImage = BitmapImageBuilder(prepared).build()
             val result = objectDetector?.detect(mpImage)
 
             val personBox = result?.detections()?.firstOrNull { detection ->
@@ -390,18 +431,19 @@ class MainActivity : AppCompatActivity() {
                 }
             }?.boundingBox()
 
-            val height = rotated.height.toFloat()
+            val height = prepared.height.toFloat()
             val boxHeightRatio = personBox?.let { it.height() / height } ?: 0f
+            val stopRatio = stopDistancePercent / 100f
 
             val command = if (personBox == null) {
                 "DIAM"
             } else {
                 val centerX = personBox.centerX()
-                val width = rotated.width.toFloat()
+                val width = prepared.width.toFloat()
                 when {
                     centerX < width * 0.35f -> "KIRI"
                     centerX > width * 0.65f -> "KANAN"
-                    boxHeightRatio >= stopDistanceRatio -> "DIAM"
+                    boxHeightRatio >= stopRatio -> "DIAM"
                     else -> "MAJU"
                 }
             }
@@ -415,9 +457,9 @@ class MainActivity : AppCompatActivity() {
                 statusText.text = "Perintah: $command"
                 targetInfoText.text = "Target: $targetIp:$esp32Port ($currentMode)"
                 distanceInfoText.text = if (personBox != null) {
-                    "Tinggi objek: $ratioPercent% | Batas stop: ${(stopDistanceRatio * 100).toInt()}%"
+                    "Tinggi objek: $ratioPercent% | Batas stop: $stopDistancePercent%"
                 } else {
-                    "Tinggi objek: - | Batas stop: ${(stopDistanceRatio * 100).toInt()}%"
+                    "Tinggi objek: - | Batas stop: $stopDistancePercent%"
                 }
             }
         } catch (e: Exception) {
@@ -429,9 +471,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun rotateBitmap(source: Bitmap, angle: Float): Bitmap {
-        if (angle == 0f) return source
-        val matrix = Matrix().apply { postRotate(angle) }
+    private fun rotateAndMirrorFrontCamera(source: Bitmap, angle: Float): Bitmap {
+        val matrix = Matrix().apply {
+            if (angle != 0f) {
+                postRotate(angle)
+            }
+            // Mirror horizontal agar kiri-kanan kamera depan sesuai arah pandang alami
+            postScale(-1f, 1f)
+        }
         return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
     }
 
