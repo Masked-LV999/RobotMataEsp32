@@ -58,11 +58,20 @@ class MainActivity : AppCompatActivity() {
     private val broadcastIp = "255.255.255.255"
     private val esp32Port = 4210
 
+    // Pembatas FPS anti-panas (~16.6 FPS)
+    private val minFrameIntervalMs = 60L
+
     // Parameter tracking & gestur
     private val toggleCooldownMs = 2500L     // Jeda dua arah setelah Lock / Unlock
     private val palmHoldConfirmMs = 350L     // Tahan 5 jari minimal 0.35 detik
     private val targetLostTimeoutMs = 1800L  // Lepas kunci otomatis jika target hilang > 1.8 detik
     private val emaAlpha = 0.6f              // Smoothing posisi horizontal (0.0 - 1.0)
+
+    // Filter 3 lapis untuk jarak (lebar objek) anti-fluktuasi
+    private val widthMedianWindow = 5        // Ambil nilai tengah dari 5 frame terakhir
+    private val widthEmaAlpha = 0.30f        // Haluskan transisi lebar objek
+    private val distanceHysteresisGap = 0.08f // Celah 8% antara ambang stop dan ambang jalan lagi
+    private val distanceDebounceFrames = 3   // Wajib stabil 3 frame berturut-turut sebelum ganti MAJU/DIAM
 
     // Batas hysteresis horizontal (rasio 0.0 - 1.0)
     private val enterLeftRatio = 0.28f
@@ -78,7 +87,8 @@ class MainActivity : AppCompatActivity() {
     private var isEyeFullscreen = false
     private var customVideoPath: String? = null
 
-    // State penguncian target (hanya diakses di cameraExecutor)
+    // State penguncian & filter (hanya diakses di cameraExecutor)
+    private var lastProcessedFrameTime = 0L
     private var isLocked = false
     private var lastTargetX = 0f
     private var lastTargetY = 0f
@@ -86,6 +96,15 @@ class MainActivity : AppCompatActivity() {
     private var lastTargetSeenTime = 0L
     private var smoothedCenterX: Float? = null
     private var currentTurnState = "CENTER"
+
+    // State filter jarak 3 lapis
+    private val widthHistory = ArrayDeque<Float>(widthMedianWindow)
+    private var smoothedWidthRatio: Float? = null
+    private var isDistanceStopped = false
+    private var pendingDistanceStopped: Boolean? = null
+    private var distanceConfirmCount = 0
+
+    // State gestur 5 jari
     private var lastToggleTime = 0L
     private var waitingHandRelease = false
     private var palmHoldStartTime = 0L
@@ -199,8 +218,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Slider batas jarak berdasarkan LEBAR badan (20% - 90%)
+        val initialResumePct = (stopWidthPercent - (distanceHysteresisGap * 100).toInt()).coerceAtLeast(10)
         distanceInfoText = TextView(this).apply {
-            text = "Lebar objek: - | Batas stop: $stopWidthPercent% (geser kanan = lebih dekat)"
+            text = "Lebar: - | Stop: $stopWidthPercent% | Jalan lagi: $initialResumePct%"
             textSize = 13f
             setPadding(0, 4, 0, 4)
         }
@@ -212,8 +232,9 @@ class MainActivity : AppCompatActivity() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     stopWidthPercent = progress + 20
+                    val resumePct = (stopWidthPercent - (distanceHysteresisGap * 100).toInt()).coerceAtLeast(10)
                     distanceInfoText.text =
-                        "Lebar objek: - | Batas stop: $stopWidthPercent% (geser kanan = lebih dekat)"
+                        "Lebar: - | Stop: $stopWidthPercent% | Jalan lagi: $resumePct%"
                 }
 
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
@@ -503,6 +524,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun processFrame(imageProxy: ImageProxy) {
+        // Pembatas FPS anti-panas: lewati frame jika belum mencapai interval minimum
+        val now = System.currentTimeMillis()
+        if (now - lastProcessedFrameTime < minFrameIntervalMs) {
+            imageProxy.close()
+            return
+        }
+        lastProcessedFrameTime = now
+
         try {
             val bitmap = imageProxy.toBitmap()
             val prepared = rotateAndMirrorFrontCamera(
@@ -512,7 +541,6 @@ class MainActivity : AppCompatActivity() {
             val mpImage = BitmapImageBuilder(prepared).build()
             val width = prepared.width.toFloat()
             val height = prepared.height.toFloat()
-            val now = System.currentTimeMillis()
 
             var command = "DIAM"
             var lockStatusMsg: String
@@ -520,7 +548,6 @@ class MainActivity : AppCompatActivity() {
 
             if (!isLocked) {
                 // === MODE STANDBY (UNLOCKED) ===
-                // Hanya jalankan GestureRecognizer agar ringan; ObjectDetector dipanggil saat 5 jari terkonfirmasi
                 val openPalms = detectOpenPalms(mpImage, width, height)
 
                 if (waitingHandRelease) {
@@ -543,7 +570,7 @@ class MainActivity : AppCompatActivity() {
                         val personBoxes = detectPersonBoxes(mpImage)
                         val matched = findPersonForPalm(openPalms, personBoxes, width, height)
                         if (matched != null) {
-                            lockTarget(matched, now)
+                            lockTarget(matched, width, now)
                             lockStatusMsg = "Status: LOCKED (target dikunci!)"
                         } else {
                             lockStatusMsg = "Status: 5 jari terbaca, badan belum terdeteksi"
@@ -567,15 +594,12 @@ class MainActivity : AppCompatActivity() {
                     lastTargetY = trackedBox.centerY()
                     lastTargetSeenTime = now
 
-                    // Cek gestur 5 jari untuk UNLOCK (tiap 4 frame, atau tiap frame saat sedang menahan 5 jari)
+                    // Optimasi Crop: cek 5 jari HANYA di dalam area crop target (penonton luar diabaikan)
                     val shouldCheckGesture = (frameCounter % 4 == 0) || (palmHoldStartTime > 0L) || waitingHandRelease
                     var unlockedNow = false
 
                     if (shouldCheckGesture) {
-                        val openPalms = detectOpenPalms(mpImage, width, height)
-                        val palmOnTarget = openPalms.any { (px, py) ->
-                            isPointNearTarget(px, py, trackedBox, width, height)
-                        }
+                        val palmOnTarget = hasOpenPalmInTargetCrop(prepared, trackedBox)
 
                         if (waitingHandRelease) {
                             if (!palmOnTarget) {
@@ -603,7 +627,7 @@ class MainActivity : AppCompatActivity() {
                         command = "DIAM"
                         lockStatusMsg = "Status: UNLOCKED (dibuka dengan 5 jari)"
                     } else {
-                        // Hitung posisi halus (EMA) + Hysteresis anti-goyang
+                        // 1. Posisi horizontal: EMA Smoothing + Hysteresis
                         val rawX = trackedBox.centerX()
                         val smoothX = smoothedCenterX?.let { emaAlpha * rawX + (1f - emaAlpha) * it } ?: rawX
                         smoothedCenterX = smoothX
@@ -627,15 +651,16 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
 
-                        // Jarak berdasarkan LEBAR badan
-                        val boxWidthRatio = trackedBox.width() / width
-                        widthRatioPercent = (boxWidthRatio * 100).toInt()
-                        val stopRatio = stopWidthPercent / 100f
+                        // 2. Jarak: Filter 3 Lapis (Median 5 frame + EMA + Hysteresis 8% + Debounce 3 frame)
+                        val rawWidthRatio = trackedBox.width() / width
+                        val filteredWidth = updateSmoothedWidth(rawWidthRatio)
+                        widthRatioPercent = (filteredWidth * 100).toInt()
+                        updateDistanceStopState(filteredWidth)
 
                         command = when {
                             currentTurnState == "KIRI" -> "KIRI"
                             currentTurnState == "KANAN" -> "KANAN"
-                            boxWidthRatio >= stopRatio -> "DIAM"
+                            isDistanceStopped -> "DIAM"
                             else -> "MAJU"
                         }
 
@@ -648,6 +673,8 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     // Target sempat hilang dari kamera
                     palmHoldStartTime = 0L
+                    pendingDistanceStopped = null
+                    distanceConfirmCount = 0
                     val lostMs = now - lastTargetSeenTime
                     if (lostMs > targetLostTimeoutMs) {
                         unlockTarget(playBeep = true, requireRelease = false)
@@ -666,14 +693,15 @@ class MainActivity : AppCompatActivity() {
             sendUdp(command, targetIp, useBroadcast)
 
             val currentStopPct = stopWidthPercent
+            val currentResumePct = (currentStopPct - (distanceHysteresisGap * 100).toInt()).coerceAtLeast(10)
             runOnUiThread {
                 statusText.text = "Perintah: $command"
                 lockInfoText.text = lockStatusMsg
                 targetInfoText.text = "Target: $targetIp:$esp32Port ($currentMode)"
                 distanceInfoText.text = if (widthRatioPercent >= 0) {
-                    "Lebar objek: $widthRatioPercent% | Batas stop: $currentStopPct%"
+                    "Lebar: $widthRatioPercent% | Stop: $currentStopPct% | Jalan lagi: $currentResumePct%"
                 } else {
-                    "Lebar objek: - | Batas stop: $currentStopPct%"
+                    "Lebar: - | Stop: $currentStopPct% | Jalan lagi: $currentResumePct%"
                 }
             }
         } catch (e: Exception) {
@@ -682,6 +710,79 @@ class MainActivity : AppCompatActivity() {
             }
         } finally {
             imageProxy.close()
+        }
+    }
+
+    private fun updateSmoothedWidth(rawWidthRatio: Float): Float {
+        if (widthHistory.size >= widthMedianWindow) {
+            widthHistory.removeFirst()
+        }
+        widthHistory.addLast(rawWidthRatio)
+
+        val sorted = widthHistory.sorted()
+        val median = sorted[sorted.size / 2]
+
+        val smoothed = smoothedWidthRatio?.let {
+            widthEmaAlpha * median + (1f - widthEmaAlpha) * it
+        } ?: median
+        smoothedWidthRatio = smoothed
+        return smoothed
+    }
+
+    private fun updateDistanceStopState(filteredWidth: Float) {
+        val stopRatio = stopWidthPercent / 100f
+        val resumeRatio = (stopRatio - distanceHysteresisGap).coerceAtLeast(0.10f)
+
+        val desiredStopped = if (isDistanceStopped) {
+            // Sedang berhenti: tetap DIAM sampai lebar turun melewati ambang jalan lagi
+            filteredWidth > resumeRatio
+        } else {
+            // Sedang boleh maju: berhenti jika lebar mencapai/melewati ambang stop
+            filteredWidth >= stopRatio
+        }
+
+        if (desiredStopped != isDistanceStopped) {
+            if (pendingDistanceStopped == desiredStopped) {
+                distanceConfirmCount++
+            } else {
+                pendingDistanceStopped = desiredStopped
+                distanceConfirmCount = 1
+            }
+
+            if (distanceConfirmCount >= distanceDebounceFrames) {
+                isDistanceStopped = desiredStopped
+                pendingDistanceStopped = null
+                distanceConfirmCount = 0
+            }
+        } else {
+            pendingDistanceStopped = null
+            distanceConfirmCount = 0
+        }
+    }
+
+    private fun hasOpenPalmInTargetCrop(prepared: Bitmap, box: RectF): Boolean {
+        val imgW = prepared.width
+        val imgH = prepared.height
+        if (imgW < 16 || imgH < 16) return false
+
+        val marginX = maxOf(box.width() * 0.15f, imgW * 0.05f)
+        val marginY = maxOf(box.height() * 0.12f, imgH * 0.05f)
+
+        val left = (box.left - marginX).toInt().coerceIn(0, imgW - 1)
+        val top = (box.top - marginY).toInt().coerceIn(0, imgH - 1)
+        val right = (box.right + marginX).toInt().coerceIn(left + 1, imgW)
+        val bottom = (box.bottom + marginY).toInt().coerceIn(top + 1, imgH)
+
+        val cropW = right - left
+        val cropH = bottom - top
+        if (cropW < 16 || cropH < 16) return false
+
+        val cropped = Bitmap.createBitmap(prepared, left, top, cropW, cropH)
+        val cropMpImage = BitmapImageBuilder(cropped).build()
+        val result = gestureRecognizer?.recognize(cropMpImage) ?: return false
+
+        return result.gestures().any { handGestures ->
+            handGestures.any { it.categoryName() == "Open_Palm" && it.score() >= 0.5f }
         }
     }
 
@@ -724,13 +825,11 @@ class MainActivity : AppCompatActivity() {
         if (personBoxes.isEmpty()) return null
         val (px, py) = palms.first()
 
-        // Prioritas 1: kotak orang yang melingkupi posisi telapak tangan (dengan margin sedikit)
         val containing = personBoxes.filter { isPointNearTarget(px, py, it, width, height) }
         if (containing.isNotEmpty()) {
             return containing.minByOrNull { hypot(it.centerX() - px, it.centerY() - py) }
         }
 
-        // Prioritas 2: orang terdekat jika tangan sedikit terentang ke samping
         val nearest = personBoxes.minByOrNull { hypot(it.centerX() - px, it.centerY() - py) }
         if (nearest != null && hypot(nearest.centerX() - px, nearest.centerY() - py) <= width * 0.40f) {
             return nearest
@@ -770,7 +869,7 @@ class MainActivity : AppCompatActivity() {
         return bestBox
     }
 
-    private fun lockTarget(box: RectF, now: Long) {
+    private fun lockTarget(box: RectF, frameWidth: Float, now: Long) {
         isLocked = true
         lastTargetBox = RectF(box)
         lastTargetX = box.centerX()
@@ -778,6 +877,16 @@ class MainActivity : AppCompatActivity() {
         smoothedCenterX = box.centerX()
         lastTargetSeenTime = now
         currentTurnState = "CENTER"
+
+        // Inisialisasi filter jarak dengan kondisi awal saat dikunci
+        val initialWidthRatio = box.width() / frameWidth
+        widthHistory.clear()
+        widthHistory.addLast(initialWidthRatio)
+        smoothedWidthRatio = initialWidthRatio
+        isDistanceStopped = initialWidthRatio >= (stopWidthPercent / 100f)
+        pendingDistanceStopped = null
+        distanceConfirmCount = 0
+
         lastToggleTime = now
         waitingHandRelease = true
         palmHoldStartTime = 0L
@@ -791,6 +900,13 @@ class MainActivity : AppCompatActivity() {
         lastTargetBox = null
         smoothedCenterX = null
         currentTurnState = "CENTER"
+
+        widthHistory.clear()
+        smoothedWidthRatio = null
+        isDistanceStopped = false
+        pendingDistanceStopped = null
+        distanceConfirmCount = 0
+
         lastToggleTime = System.currentTimeMillis()
         waitingHandRelease = requireRelease
         palmHoldStartTime = 0L
