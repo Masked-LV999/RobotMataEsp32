@@ -30,3 +30,9 @@ jobs:
         with:
           name: RobotMataESP32-debug
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Download MediaPipe Gesture Recognizer Model
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fL -o app/src/main/assets/gesture_recognizer.task \
+            https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task
